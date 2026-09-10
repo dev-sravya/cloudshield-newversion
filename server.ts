@@ -236,6 +236,76 @@ Respond in JSON matching schema:
   }
 }
 
+// Safe in-memory caches with short TTL
+let cachedChanges: { data: any; timestamp: number } | null = null;
+const CHANGES_CACHE_TTL = 45000; // 45 seconds
+
+const resourceCache = new Map<string, { data: any; timestamp: number }>();
+const RESOURCE_CACHE_TTL = 120000; // 2 minutes
+
+// Keyed strictly by changeId to guarantee no cross-change contamination
+const assessmentCache = new Map<string, { data: any; timestamp: number }>();
+const ASSESSMENT_CACHE_TTL = 60000; // 60 seconds
+
+const whatIfCache = new Map<string, { data: any; timestamp: number }>();
+const WHAT_IF_CACHE_TTL = 60000; // 60 seconds
+
+async function generateAiExplanation(evidencePayload: any, riskLevel?: string): Promise<{
+  content: string;
+  source: 'gemini' | 'unavailable';
+  error?: string;
+}> {
+  try {
+    const gemini = getGemini();
+    const geminiPrompt = `
+You are the AI reasoning engine of CloudShield, an evidence-based Cloud Change Risk Assistant.
+TASK: Interpret the following cloud telemetry evidence retrieved directly from Google BigQuery.
+CRITICAL INSTRUCTION:
+"Use only the supplied evidence. Do not invent facts, numbers, incidents, dependencies, resources or historical events. If evidence is insufficient, explicitly say so."
+
+SUPPLIED EVIDENCE:
+${JSON.stringify(evidencePayload, null, 2)}
+
+Provide your response in JSON format with an "explanation" string addressing:
+- Why the change has its current risk level (${riskLevel || 'Not provided in database'}).
+- What specific evidence makes this change risky or safe (environment, criticality, change category).
+- What parts of the dependency graph matter.
+- Whether historical incidents increase concern (reference actual incident severity and resolutions).
+`;
+
+    const geminiResponse = await callWithTimeout(
+      gemini.models.generateContent({
+        model: VERTEX_MODEL,
+        contents: geminiPrompt,
+        config: {
+          responseMimeType: 'application/json',
+          responseSchema: {
+            type: Type.OBJECT,
+            properties: {
+              explanation: { type: Type.STRING },
+            },
+            required: ['explanation'],
+          },
+        },
+      }),
+      20000
+    );
+
+    const parsed = JSON.parse(geminiResponse.text?.trim() || '{}');
+    return {
+      content: parsed.explanation || '',
+      source: 'gemini',
+    };
+  } catch (geminiErr: unknown) {
+    const aiError = geminiErr instanceof Error ? geminiErr.message : String(geminiErr);
+    return {
+      content: `Gemini AI reasoning unavailable: ${aiError}`,
+      source: 'unavailable',
+      error: aiError,
+    };
+  }
+}
+
 async function startServer() {
   const app = express();
   app.use(express.json());
@@ -244,40 +314,50 @@ async function startServer() {
   // 1. GET /api/status
   // ==========================================
   app.get('/api/status', async (req: Request, res: Response) => {
-    const geminiStatus = await checkGeminiStatus();
-
-    try {
-      const bq = getBigQuery();
-      // Test real BigQuery access against the changes table
-      const [rows] = await bq.query({
-        query: `SELECT change_id FROM \`${PROJECT_ID}.${DATASET_ID}.changes\` LIMIT 1`,
-        location: LOCATION,
-      });
-
-      res.json({
-        ok: true,
-        bigquery: {
+    const bqPromise = (async () => {
+      try {
+        const bq = getBigQuery();
+        const [rows] = await bq.query({
+          query: `SELECT change_id FROM \`${PROJECT_ID}.${DATASET_ID}.changes\` LIMIT 1`,
+          location: LOCATION,
+        });
+        return {
           connected: true,
           project: PROJECT_ID,
           dataset: DATASET_ID,
           location: LOCATION,
           verifiedQuery: `SELECT change_id FROM \`${PROJECT_ID}.${DATASET_ID}.changes\` LIMIT 1`,
           sampleRowsRetrieved: rows.length,
-        },
-        gemini: geminiStatus,
-      });
-    } catch (err: unknown) {
-      const message = err instanceof Error ? err.message : String(err);
-      res.status(503).json({
-        ok: false,
-        bigquery: {
+        };
+      } catch (err: unknown) {
+        const message = err instanceof Error ? err.message : String(err);
+        return {
           connected: false,
           error: 'BigQuery data unavailable',
           details: message,
           project: PROJECT_ID,
           dataset: DATASET_ID,
           location: LOCATION,
-        },
+        };
+      }
+    })();
+
+    // Probe Gemini and BigQuery in parallel
+    const [geminiStatus, bqStatus] = await Promise.all([
+      checkGeminiStatus(req.query.force === 'true'),
+      bqPromise,
+    ]);
+
+    if (bqStatus.connected) {
+      res.json({
+        ok: true,
+        bigquery: bqStatus,
+        gemini: geminiStatus,
+      });
+    } else {
+      res.status(503).json({
+        ok: false,
+        bigquery: bqStatus,
         gemini: geminiStatus,
       });
     }
@@ -287,6 +367,11 @@ async function startServer() {
   // 2. GET /api/changes
   // ==========================================
   app.get('/api/changes', async (req: Request, res: Response) => {
+    const force = req.query.force === 'true';
+    if (!force && cachedChanges && (Date.now() - cachedChanges.timestamp < CHANGES_CACHE_TTL)) {
+      return res.json(cachedChanges.data);
+    }
+
     try {
       const bq = getBigQuery();
       const query = `
@@ -309,7 +394,10 @@ async function startServer() {
         proposed_date: formatDateField(row.proposed_date),
       }));
 
-      res.json({ ok: true, changes: sanitized, query });
+      const payload = { ok: true, changes: sanitized, query };
+      cachedChanges = { data: payload, timestamp: Date.now() };
+
+      res.json(payload);
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : String(err);
       res.status(503).json({
@@ -328,6 +416,14 @@ async function startServer() {
   // ==========================================
   app.get('/api/resources/:resourceId', async (req: Request, res: Response) => {
     const { resourceId } = req.params;
+    const force = req.query.force === 'true';
+    if (!force && resourceCache.has(resourceId)) {
+      const cached = resourceCache.get(resourceId)!;
+      if (Date.now() - cached.timestamp < RESOURCE_CACHE_TTL) {
+        return res.json(cached.data);
+      }
+    }
+
     try {
       const bq = getBigQuery();
       const query = `
@@ -352,7 +448,10 @@ async function startServer() {
         return res.status(404).json({ ok: false, error: 'Resource not found in BigQuery', resourceId });
       }
 
-      res.json({ ok: true, resource: rows[0], query });
+      const payload = { ok: true, resource: rows[0], query };
+      resourceCache.set(resourceId, { data: payload, timestamp: Date.now() });
+
+      res.json(payload);
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : String(err);
       res.status(503).json({
@@ -521,53 +620,95 @@ async function startServer() {
 
       if (!finalEvidence && changeId) {
         const bq = getBigQuery();
-        // Fetch change
-        const [cRows] = await bq.query({
-          query: `SELECT * FROM \`${PROJECT_ID}.${DATASET_ID}.changes\` WHERE change_id = @changeId LIMIT 1`,
-          params: { changeId },
-          location: LOCATION,
-        });
-        if (cRows.length === 0) {
-          return res.status(404).json({ ok: false, error: `Change ${changeId} not found` });
+        
+        let changeRecord: any;
+        let targetRes = resourceId;
+
+        if (targetRes) {
+          // Parallelize all 5 queries when resourceId is already known
+          const [cRes, resRes, riskRes, depRes, incRes] = await Promise.all([
+            bq.query({
+              query: `SELECT * FROM \`${PROJECT_ID}.${DATASET_ID}.changes\` WHERE change_id = @changeId LIMIT 1`,
+              params: { changeId },
+              location: LOCATION,
+            }),
+            bq.query({
+              query: `SELECT * FROM \`${PROJECT_ID}.${DATASET_ID}.resources\` WHERE resource_id = @targetRes LIMIT 1`,
+              params: { targetRes },
+              location: LOCATION,
+            }),
+            bq.query({
+              query: `SELECT * FROM \`${PROJECT_ID}.${DATASET_ID}.risk_assessment\` WHERE change_id = @changeId LIMIT 1`,
+              params: { changeId },
+              location: LOCATION,
+            }),
+            bq.query({
+              query: `SELECT * FROM \`${PROJECT_ID}.${DATASET_ID}.dependencies_clean\` WHERE source_resource_id = @targetRes OR target_resource_id = @targetRes`,
+              params: { targetRes },
+              location: LOCATION,
+            }),
+            bq.query({
+              query: `SELECT * FROM \`${PROJECT_ID}.${DATASET_ID}.incidents\` WHERE resource_id = @targetRes`,
+              params: { targetRes },
+              location: LOCATION,
+            }),
+          ]);
+
+          if (cRes[0].length === 0) {
+            return res.status(404).json({ ok: false, error: `Change ${changeId} not found` });
+          }
+
+          finalEvidence = {
+            change: cRes[0][0],
+            resource: resRes[0][0] || null,
+            riskAssessment: riskRes[0][0] || null,
+            dependencies: depRes[0],
+            incidents: incRes[0],
+          };
+        } else {
+          // Fetch change first, then parallelize the remaining 4
+          const [cRows] = await bq.query({
+            query: `SELECT * FROM \`${PROJECT_ID}.${DATASET_ID}.changes\` WHERE change_id = @changeId LIMIT 1`,
+            params: { changeId },
+            location: LOCATION,
+          });
+          if (cRows.length === 0) {
+            return res.status(404).json({ ok: false, error: `Change ${changeId} not found` });
+          }
+          changeRecord = cRows[0];
+          targetRes = changeRecord.resource_id;
+
+          const [resRes, riskRes, depRes, incRes] = await Promise.all([
+            bq.query({
+              query: `SELECT * FROM \`${PROJECT_ID}.${DATASET_ID}.resources\` WHERE resource_id = @targetRes LIMIT 1`,
+              params: { targetRes },
+              location: LOCATION,
+            }),
+            bq.query({
+              query: `SELECT * FROM \`${PROJECT_ID}.${DATASET_ID}.risk_assessment\` WHERE change_id = @changeId LIMIT 1`,
+              params: { changeId },
+              location: LOCATION,
+            }),
+            bq.query({
+              query: `SELECT * FROM \`${PROJECT_ID}.${DATASET_ID}.dependencies_clean\` WHERE source_resource_id = @targetRes OR target_resource_id = @targetRes`,
+              params: { targetRes },
+              location: LOCATION,
+            }),
+            bq.query({
+              query: `SELECT * FROM \`${PROJECT_ID}.${DATASET_ID}.incidents\` WHERE resource_id = @targetRes`,
+              params: { targetRes },
+              location: LOCATION,
+            }),
+          ]);
+
+          finalEvidence = {
+            change: changeRecord,
+            resource: resRes[0][0] || null,
+            riskAssessment: riskRes[0][0] || null,
+            dependencies: depRes[0],
+            incidents: incRes[0],
+          };
         }
-        const changeRecord = cRows[0];
-        const targetRes = resourceId || changeRecord.resource_id;
-
-        // Fetch resource
-        const [resRows] = await bq.query({
-          query: `SELECT * FROM \`${PROJECT_ID}.${DATASET_ID}.resources\` WHERE resource_id = @targetRes LIMIT 1`,
-          params: { targetRes },
-          location: LOCATION,
-        });
-
-        // Fetch risk_assessment
-        const [riskRows] = await bq.query({
-          query: `SELECT * FROM \`${PROJECT_ID}.${DATASET_ID}.risk_assessment\` WHERE change_id = @changeId LIMIT 1`,
-          params: { changeId },
-          location: LOCATION,
-        });
-
-        // Fetch dependencies
-        const [depRows] = await bq.query({
-          query: `SELECT * FROM \`${PROJECT_ID}.${DATASET_ID}.dependencies_clean\` WHERE source_resource_id = @targetRes OR target_resource_id = @targetRes`,
-          params: { targetRes },
-          location: LOCATION,
-        });
-
-        // Fetch incidents
-        const [incRows] = await bq.query({
-          query: `SELECT * FROM \`${PROJECT_ID}.${DATASET_ID}.incidents\` WHERE resource_id = @targetRes`,
-          params: { targetRes },
-          location: LOCATION,
-        });
-
-        finalEvidence = {
-          change: changeRecord,
-          resource: resRows[0] || null,
-          riskAssessment: riskRows[0] || null,
-          dependencies: depRows,
-          incidents: incRows,
-        };
       }
 
       if (!finalEvidence) {
@@ -591,49 +732,26 @@ async function startServer() {
   // 8. Full Assessment: POST /api/assess
   // ==========================================
   app.post('/api/assess', async (req: Request, res: Response) => {
-    const { changeId, resourceId } = req.body;
+    const { changeId, resourceId, force } = req.body;
     if (!changeId) {
       return res.status(400).json({ ok: false, error: 'changeId is required' });
+    }
+
+    // Safe in-memory caching keyed strictly by changeId
+    if (!force && assessmentCache.has(changeId)) {
+      const cached = assessmentCache.get(changeId)!;
+      if (Date.now() - cached.timestamp < ASSESSMENT_CACHE_TTL) {
+        return res.json(cached.data);
+      }
     }
 
     try {
       const bq = getBigQuery();
 
-      // Step A: Retrieve Change
       const changesQuery = `
         SELECT * FROM \`${PROJECT_ID}.${DATASET_ID}.changes\`
         WHERE change_id = @changeId LIMIT 1
       `;
-      const [changeRows] = await bq.query({
-        query: changesQuery,
-        params: { changeId },
-        location: LOCATION,
-      });
-
-      if (changeRows.length === 0) {
-        return res.status(404).json({ ok: false, error: `Change ID ${changeId} not found in BigQuery` });
-      }
-
-      const changeRecord = {
-        ...changeRows[0],
-        proposed_date: formatDateField(changeRows[0].proposed_date),
-      };
-
-      const targetResourceId = resourceId || changeRecord.resource_id;
-
-      // Step B: Retrieve Resource
-      const resourcesQuery = `
-        SELECT * FROM \`${PROJECT_ID}.${DATASET_ID}.resources\`
-        WHERE resource_id = @targetResourceId LIMIT 1
-      `;
-      const [resourceRows] = await bq.query({
-        query: resourcesQuery,
-        params: { targetResourceId },
-        location: LOCATION,
-      });
-      const resourceRecord = resourceRows[0] || null;
-
-      // Step C: Retrieve Risk Assessment
       const riskAssessmentQuery = `
         SELECT 
           change_id,
@@ -649,27 +767,87 @@ async function startServer() {
         FROM \`${PROJECT_ID}.${DATASET_ID}.risk_assessment\`
         WHERE change_id = @changeId LIMIT 1
       `;
-      const [riskRows] = await bq.query({
-        query: riskAssessmentQuery,
-        params: { changeId },
-        location: LOCATION,
-      });
-      const riskRecord = riskRows[0] || null;
-
-      // Step D: Retrieve Dependencies
+      const resourcesQuery = `
+        SELECT * FROM \`${PROJECT_ID}.${DATASET_ID}.resources\`
+        WHERE resource_id = @targetResourceId LIMIT 1
+      `;
       const dependenciesQuery = `
         SELECT source_resource_id, target_resource_id, dependency_type
         FROM \`${PROJECT_ID}.${DATASET_ID}.dependencies_clean\`
         WHERE source_resource_id = @targetResourceId OR target_resource_id = @targetResourceId
       `;
-      const [depRows] = await bq.query({
-        query: dependenciesQuery,
-        params: { targetResourceId },
-        location: LOCATION,
-      });
+      const incidentsQuery = `
+        SELECT incident_id, incident_date, resource_id, severity, incident_type, description, resolution
+        FROM \`${PROJECT_ID}.${DATASET_ID}.incidents\`
+        WHERE resource_id = @targetResourceId
+        ORDER BY incident_date DESC
+      `;
 
+      let changeRows: any[];
+      let resourceRows: any[] = [];
+      let riskRows: any[] = [];
+      let depRows: any[] = [];
+      let incidentRows: any[] = [];
+
+      // PARALLELIZE BIGQUERY QUERIES:
+      // If resourceId is supplied by the caller, run all 5 queries simultaneously in Promise.all!
+      if (resourceId) {
+        const [cRes, resRes, riskRes, depRes, incRes] = await Promise.all([
+          bq.query({ query: changesQuery, params: { changeId }, location: LOCATION }),
+          bq.query({ query: resourcesQuery, params: { targetResourceId: resourceId }, location: LOCATION }),
+          bq.query({ query: riskAssessmentQuery, params: { changeId }, location: LOCATION }),
+          bq.query({ query: dependenciesQuery, params: { targetResourceId: resourceId }, location: LOCATION }),
+          bq.query({ query: incidentsQuery, params: { targetResourceId: resourceId }, location: LOCATION }),
+        ]);
+        changeRows = cRes[0];
+        resourceRows = resRes[0];
+        riskRows = riskRes[0];
+        depRows = depRes[0];
+        incidentRows = incRes[0];
+      } else {
+        const [cRes] = await bq.query({ query: changesQuery, params: { changeId }, location: LOCATION });
+        changeRows = cRes;
+      }
+
+      if (!changeRows || changeRows.length === 0) {
+        return res.status(404).json({ ok: false, error: `Change ID ${changeId} not found in BigQuery` });
+      }
+
+      const changeRecord = {
+        ...changeRows[0],
+        proposed_date: formatDateField(changeRows[0].proposed_date),
+      };
+
+      const actualResourceId = changeRecord.resource_id;
+
+      // In the rare event resourceId was not passed or differed from the actual record:
+      if (!resourceId || actualResourceId !== resourceId) {
+        const [resRes, riskRes, depRes, incRes] = await Promise.all([
+          bq.query({ query: resourcesQuery, params: { targetResourceId: actualResourceId }, location: LOCATION }),
+          riskRows.length > 0 ? Promise.resolve([riskRows]) : bq.query({ query: riskAssessmentQuery, params: { changeId }, location: LOCATION }),
+          bq.query({ query: dependenciesQuery, params: { targetResourceId: actualResourceId }, location: LOCATION }),
+          bq.query({ query: incidentsQuery, params: { targetResourceId: actualResourceId }, location: LOCATION }),
+        ]);
+        resourceRows = resRes[0];
+        riskRows = riskRes[0];
+        depRows = depRes[0];
+        incidentRows = incRes[0];
+      }
+
+      const resourceRecord = resourceRows[0] || null;
+      if (resourceRecord && resourceRecord.resource_id) {
+        resourceCache.set(resourceRecord.resource_id, { data: { ok: true, resource: resourceRecord }, timestamp: Date.now() });
+      }
+
+      const riskRecord = riskRows[0] || null;
+      const incidents = incidentRows.map((r: Record<string, unknown>) => ({
+        ...r,
+        incident_date: formatDateField(r.incident_date),
+      }));
+
+      // Correlate connected resources for Blast Radius
       const connectedResourceIds = new Set<string>();
-      connectedResourceIds.add(targetResourceId);
+      connectedResourceIds.add(actualResourceId);
       depRows.forEach((d: { source_resource_id: string; target_resource_id: string }) => {
         connectedIdsAdd(connectedResourceIds, d.source_resource_id);
         connectedIdsAdd(connectedResourceIds, d.target_resource_id);
@@ -678,39 +856,32 @@ async function startServer() {
       let graphNodes: Record<string, unknown>[] = [];
       if (connectedResourceIds.size > 0) {
         const idList = Array.from(connectedResourceIds);
-        const [nodeDetails] = await bq.query({
-          query: `
-            SELECT resource_id, resource_name, resource_type, environment, region, criticality
-            FROM \`${PROJECT_ID}.${DATASET_ID}.resources\`
-            WHERE resource_id IN UNNEST(@idList)
-          `,
-          params: { idList },
-          location: LOCATION,
-        });
-        graphNodes = nodeDetails;
+        // Optimize: if the only node is the target resource, reuse it directly without an extra query
+        if (idList.length === 1 && resourceRecord) {
+          graphNodes = [resourceRecord];
+        } else {
+          const [nodeDetails] = await bq.query({
+            query: `
+              SELECT resource_id, resource_name, resource_type, environment, region, criticality
+              FROM \`${PROJECT_ID}.${DATASET_ID}.resources\`
+              WHERE resource_id IN UNNEST(@idList)
+            `,
+            params: { idList },
+            location: LOCATION,
+          });
+          graphNodes = nodeDetails;
+          nodeDetails.forEach((node: any) => {
+            if (node.resource_id) {
+              resourceCache.set(node.resource_id, { data: { ok: true, resource: node }, timestamp: Date.now() });
+            }
+          });
+        }
       }
-
-      // Step E: Retrieve Incidents
-      const incidentsQuery = `
-        SELECT incident_id, incident_date, resource_id, severity, incident_type, description, resolution
-        FROM \`${PROJECT_ID}.${DATASET_ID}.incidents\`
-        WHERE resource_id = @targetResourceId
-        ORDER BY incident_date DESC
-      `;
-      const [incidentRows] = await bq.query({
-        query: incidentsQuery,
-        params: { targetResourceId },
-        location: LOCATION,
-      });
-      const incidents = incidentRows.map((r: Record<string, unknown>) => ({
-        ...r,
-        incident_date: formatDateField(r.incident_date),
-      }));
 
       // Assemble Dependency Graph data
       const dependencyGraph = {
         nodes: graphNodes.map((node: Record<string, unknown>) => {
-          const isSelected = node.resource_id === targetResourceId;
+          const isSelected = node.resource_id === actualResourceId;
           return {
             resource_id: String(node.resource_id || ''),
             resource_name: String(node.resource_name || node.resource_id || ''),
@@ -737,60 +908,14 @@ async function startServer() {
         incidents,
       };
 
-      // AI Risk Explanation
-      let aiExplanationText = '';
-      let aiSource: 'gemini' | 'evidence-fallback' | 'unavailable' = 'unavailable';
-      let aiError: string | undefined = undefined;
+      // PARALLELIZE AI GENERATION:
+      // Run AI Risk Explanation and Change Gate evaluation concurrently!
+      const [aiExplanation, changeGate] = await Promise.all([
+        generateAiExplanation(evidencePayload, riskRecord?.risk_level),
+        evaluateGateDecision(evidencePayload),
+      ]);
 
-      try {
-        const gemini = getGemini();
-        const geminiPrompt = `
-You are the AI reasoning engine of CloudShield, an evidence-based Cloud Change Risk Assistant.
-TASK: Interpret the following cloud telemetry evidence retrieved directly from Google BigQuery.
-CRITICAL INSTRUCTION:
-"Use only the supplied evidence. Do not invent facts, numbers, incidents, dependencies, resources or historical events. If evidence is insufficient, explicitly say so."
-
-SUPPLIED EVIDENCE:
-${JSON.stringify(evidencePayload, null, 2)}
-
-Provide your response in JSON format with an "explanation" string addressing:
-- Why the change has its current risk level (${riskRecord?.risk_level || 'Not provided in database'}).
-- What specific evidence makes this change risky or safe (environment, criticality, change category).
-- What parts of the dependency graph matter.
-- Whether historical incidents increase concern (reference actual incident severity and resolutions).
-`;
-
-        const geminiResponse = await callWithTimeout(
-          gemini.models.generateContent({
-            model: VERTEX_MODEL,
-            contents: geminiPrompt,
-            config: {
-              responseMimeType: 'application/json',
-              responseSchema: {
-                type: Type.OBJECT,
-                properties: {
-                  explanation: { type: Type.STRING },
-                },
-                required: ['explanation'],
-              },
-            },
-          }),
-          20000
-        );
-
-        const parsed = JSON.parse(geminiResponse.text?.trim() || '{}');
-        aiExplanationText = parsed.explanation || '';
-        aiSource = 'gemini';
-      } catch (geminiErr: unknown) {
-        aiError = geminiErr instanceof Error ? geminiErr.message : String(geminiErr);
-        aiSource = 'unavailable';
-        aiExplanationText = `Gemini AI reasoning unavailable: ${aiError}`;
-      }
-
-      // Evaluate Change Gate
-      const changeGate = await evaluateGateDecision(evidencePayload);
-
-      res.json({
+      const assessmentResult = {
         ok: true,
         change: changeRecord,
         resource: resourceRecord,
@@ -798,11 +923,7 @@ Provide your response in JSON format with an "explanation" string addressing:
         dependencies: depRows,
         dependencyGraph,
         incidents,
-        aiExplanation: {
-          content: aiExplanationText,
-          source: aiSource,
-          error: aiError,
-        },
+        aiExplanation,
         changeGate,
         evidenceTrail: {
           changesQuery,
@@ -814,7 +935,15 @@ Provide your response in JSON format with an "explanation" string addressing:
           dataset: DATASET_ID,
           project: PROJECT_ID,
         },
+      };
+
+      // Store in safe in-memory cache strictly for this changeId
+      assessmentCache.set(changeId, {
+        data: assessmentResult,
+        timestamp: Date.now(),
       });
+
+      res.json(assessmentResult);
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : String(err);
       res.status(503).json({
@@ -835,6 +964,15 @@ Provide your response in JSON format with an "explanation" string addressing:
     const { scenario, evidence } = req.body;
     if (!scenario || !evidence) {
       return res.status(400).json({ ok: false, error: 'Scenario and evidence payload are required' });
+    }
+
+    const changeId = evidence?.change?.change_id || 'general';
+    const cacheKey = `${changeId}:::${scenario}`;
+    if (whatIfCache.has(cacheKey)) {
+      const cached = whatIfCache.get(cacheKey)!;
+      if (Date.now() - cached.timestamp < WHAT_IF_CACHE_TTL) {
+        return res.json(cached.data);
+      }
     }
 
     try {
@@ -882,7 +1020,10 @@ Return JSON strictly matching schema:
       );
 
       const parsed = JSON.parse(geminiResponse.text?.trim() || '{}');
-      res.json({ ok: true, simulation: parsed });
+      const payload = { ok: true, simulation: parsed };
+      whatIfCache.set(cacheKey, { data: payload, timestamp: Date.now() });
+
+      res.json(payload);
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : String(err);
       console.warn('What-If Gemini call failed:', message);

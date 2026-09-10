@@ -1,15 +1,21 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState, lazy, Suspense } from 'react';
 import { Header } from './components/Header';
 import { BigQueryErrorBanner } from './components/BigQueryErrorBanner';
 import { ChangeSelector } from './components/ChangeSelector';
 import { RiskOverview } from './components/RiskOverview';
 import { BlastRadiusGraph } from './components/BlastRadiusGraph';
 import { HistoricalIncidents } from './components/HistoricalIncidents';
-import { WhatIfSimulator } from './components/WhatIfSimulator';
 import { ChangeGate } from './components/ChangeGate';
-import { EvidenceTrail } from './components/EvidenceTrail';
 import { AssessmentResponse, BigQueryStatus, ChangeRecord } from './types';
 import { AlertCircle, RefreshCw, Server, Shield, Sparkles } from 'lucide-react';
+
+// Lazy-load expensive below-the-fold components to reduce initial bundle and render cost
+const WhatIfSimulator = lazy(() =>
+  import('./components/WhatIfSimulator').then((m) => ({ default: m.WhatIfSimulator }))
+);
+const EvidenceTrail = lazy(() =>
+  import('./components/EvidenceTrail').then((m) => ({ default: m.EvidenceTrail }))
+);
 
 export default function App() {
   const [bqStatus, setBqStatus] = useState<BigQueryStatus | null>(null);
@@ -24,43 +30,50 @@ export default function App() {
   const [isAssessing, setIsAssessing] = useState<boolean>(false);
   const [assessmentError, setAssessmentError] = useState<string | null>(null);
 
-  // 1. Check System Connectivity (BigQuery + Gemini)
+  // In-memory cache for loaded assessments to provide instantaneous switching between changes
+  const assessmentCache = useRef<Record<string, AssessmentResponse>>({});
+
+  // 1. Check System Connectivity (BigQuery + Gemini) and load initial changes in parallel
   const checkStatusAndLoad = async () => {
     setIsCheckingStatus(true);
     setAssessmentError(null);
 
-    try {
-      const res = await fetch('/api/status');
-      const contentType = res.headers.get('content-type') || '';
-      let data: any = null;
-      if (contentType.includes('application/json')) {
-        data = await res.json();
-      } else {
-        const text = await res.text();
-        throw new Error(`Server returned non-JSON response (${res.status}): ${text.slice(0, 150)}`);
+    const statusPromise = (async () => {
+      try {
+        const res = await fetch('/api/status');
+        const contentType = res.headers.get('content-type') || '';
+        let data: any = null;
+        if (contentType.includes('application/json')) {
+          data = await res.json();
+        } else {
+          const text = await res.text();
+          throw new Error(`Server returned non-JSON response (${res.status}): ${text.slice(0, 150)}`);
+        }
+        setBqStatus(data.bigquery);
+        setGeminiAvailable(data.gemini?.available ?? true);
+        return data.bigquery?.connected ?? false;
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        setBqStatus({
+          connected: false,
+          error: 'BigQuery data unavailable',
+          details: msg,
+          project: 'project-89de941d-00d0-4f2f-98f',
+          dataset: 'cloudshield',
+        });
+        return false;
+      } finally {
+        setIsCheckingStatus(false);
       }
-      setBqStatus(data.bigquery);
-      setGeminiAvailable(data.gemini?.available ?? true);
+    })();
 
-      if (data.bigquery?.connected) {
-        await loadChanges();
-      } else {
-        setChanges([]);
-        setAssessment(null);
-      }
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : String(err);
-      setBqStatus({
-        connected: false,
-        error: 'BigQuery data unavailable',
-        details: msg,
-        project: 'project-89de941d-00d0-4f2f-98f',
-        dataset: 'cloudshield',
-      });
-      setChanges([]);
-      setAssessment(null);
-    } finally {
-      setIsCheckingStatus(false);
+    // Launch changes loading in parallel for fast initial render
+    const changesPromise = loadChanges();
+
+    const [bqConnected] = await Promise.all([statusPromise, changesPromise]);
+    if (!bqConnected) {
+      // If status confirms BigQuery is disconnected and changes could not be fetched
+      setChanges((prev) => (prev.length > 0 ? prev : []));
     }
   };
 
@@ -86,20 +99,29 @@ export default function App() {
       if (fetchedChanges.length > 0) {
         const firstChange = fetchedChanges[0];
         setSelectedChangeId(firstChange.change_id);
-        // Automatically assess initial change for a seamless demo experience
-        runAssessment(firstChange.change_id, firstChange.resource_id);
+        // Automatically assess initial change with parallel telemetry
+        runAssessment(firstChange.change_id, firstChange.resource_id, false);
       }
+      return true;
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
       setAssessmentError(msg);
+      return false;
     } finally {
       setIsLoadingChanges(false);
     }
   };
 
   // 3. Assess Risk Pipeline: BigQuery Telemetry + Gemini Reasoning
-  const runAssessment = async (changeId: string, resourceId?: string) => {
+  const runAssessment = async (changeId: string, resourceId?: string, force = false) => {
     if (!changeId) return;
+
+    // Instant return if previously assessed in this session and not a forced reload
+    if (!force && assessmentCache.current[changeId]) {
+      setAssessment(assessmentCache.current[changeId]);
+      return;
+    }
+
     setIsAssessing(true);
     setAssessmentError(null);
 
@@ -107,7 +129,7 @@ export default function App() {
       const res = await fetch('/api/assess', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ changeId, resourceId }),
+        body: JSON.stringify({ changeId, resourceId, force }),
       });
 
       const contentType = res.headers.get('content-type') || '';
@@ -123,6 +145,7 @@ export default function App() {
         throw new Error(data.details || data.error || `HTTP ${res.status}: Failed to assess change`);
       }
 
+      assessmentCache.current[changeId] = data;
       setAssessment(data);
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -137,7 +160,7 @@ export default function App() {
     setSelectedChangeId(newChangeId);
     const target = changes.find((c) => c.change_id === newChangeId);
     if (target) {
-      runAssessment(target.change_id, target.resource_id);
+      runAssessment(target.change_id, target.resource_id, false);
     }
   };
 
@@ -183,7 +206,7 @@ export default function App() {
           changes={changes}
           selectedChangeId={selectedChangeId}
           onSelectChange={handleSelectChange}
-          onAssessRisk={() => selectedChange && runAssessment(selectedChange.change_id, selectedChange.resource_id)}
+          onAssessRisk={() => selectedChange && runAssessment(selectedChange.change_id, selectedChange.resource_id, true)}
           isAssessing={isAssessing}
           disabled={!bqStatus?.connected || isCheckingStatus}
         />
@@ -196,7 +219,7 @@ export default function App() {
               Gathering Real BigQuery Evidence &amp; Running Gemini Risk Reasoning...
             </p>
             <p className="text-xs text-slate-500 font-mono mt-1">
-              Correlating cloudshield.changes • resources • risk_assessment • dependencies_clean • incidents
+              Correlating cloudshield.changes • resources • risk_assessment • dependencies_clean • incidents in parallel
             </p>
           </div>
         )}
@@ -220,8 +243,17 @@ export default function App() {
               resourceId={selectedChange?.resource_id || assessment.change.resource_id}
             />
 
-            {/* 5. What-If Change Simulator */}
-            <WhatIfSimulator assessment={assessment} />
+            {/* 5. What-If Change Simulator (Lazy-loaded) */}
+            <Suspense
+              fallback={
+                <div className="my-6 p-8 text-center rounded-2xl border border-slate-800 bg-slate-900/30 text-slate-400 font-mono text-xs flex items-center justify-center gap-2">
+                  <RefreshCw className="w-4 h-4 animate-spin text-cyan-400" />
+                  <span>Loading What-If Simulator...</span>
+                </div>
+              }
+            >
+              <WhatIfSimulator assessment={assessment} />
+            </Suspense>
 
             {/* 6. Autonomous Policy Gate */}
             <ChangeGate
@@ -229,8 +261,17 @@ export default function App() {
               changeId={assessment.change.change_id}
             />
 
-            {/* 7. Evidence Trail */}
-            <EvidenceTrail assessment={assessment} />
+            {/* 7. Evidence Trail (Lazy-loaded) */}
+            <Suspense
+              fallback={
+                <div className="my-6 p-8 text-center rounded-2xl border border-slate-800 bg-slate-900/30 text-slate-400 font-mono text-xs flex items-center justify-center gap-2">
+                  <RefreshCw className="w-4 h-4 animate-spin text-cyan-400" />
+                  <span>Loading BigQuery Evidence Trail...</span>
+                </div>
+              }
+            >
+              <EvidenceTrail assessment={assessment} />
+            </Suspense>
           </div>
         )}
 
