@@ -201,7 +201,10 @@ export const EvidenceTrail: React.FC<EvidenceTrailProps> = ({ assessment }) => {
                         <th className="p-2">risk_level</th>
                         <th className="p-2">criticality</th>
                         <th className="p-2">environment</th>
-                        <th className="p-2">historical_incident_count</th>
+                        <th className="p-2">
+                          historical_incident_count
+                          <span className="block text-[9px] text-slate-500 normal-case font-normal">(stored assessment signal)</span>
+                        </th>
                         <th className="p-2">potentially_affected_resource_count</th>
                       </tr>
                     </thead>
@@ -270,7 +273,9 @@ export const EvidenceTrail: React.FC<EvidenceTrailProps> = ({ assessment }) => {
                 <span className="text-cyan-400 font-bold flex items-center gap-1.5">
                   <Database className="w-3.5 h-3.5" /> Table: cloudshield.incidents
                 </span>
-                <span className="text-[10px] text-slate-500">{incidents.length} Rows</span>
+                <span className="text-[10px] text-slate-400 font-mono">
+                  {incidents.length} matching historical incident {incidents.length === 1 ? 'record' : 'records'}
+                </span>
               </div>
               {incidents.length > 0 ? (
                 <div className="overflow-x-auto">
@@ -308,7 +313,7 @@ export const EvidenceTrail: React.FC<EvidenceTrailProps> = ({ assessment }) => {
                   </table>
                 </div>
               ) : (
-                <p className="text-slate-500 py-2">No historical incidents found in incidents table.</p>
+                <p className="text-slate-500 py-2">0 matching historical incident records found in incidents table.</p>
               )}
             </div>
           )}

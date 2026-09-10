@@ -126,14 +126,14 @@ export const RiskOverview: React.FC<RiskOverviewProps> = ({ assessment }) => {
             </div>
 
             <div className="p-3.5 rounded-xl bg-slate-900/60 border border-slate-800">
-              <span className="text-slate-500 font-mono uppercase tracking-wider block mb-1 flex items-center gap-1">
-                <Flame className="w-3 h-3 text-rose-400" /> Historical Incidents
+              <span className="text-slate-500 font-mono uppercase tracking-wider block mb-1 flex items-center gap-1 text-[11px]">
+                <Flame className="w-3 h-3 text-rose-400 shrink-0" /> Historical Incident Count (risk_assessment)
               </span>
               <span className="font-mono font-bold text-lg text-white">
                 {incidentCount}
               </span>
               <span className="text-slate-500 font-mono text-[10px] block mt-0.5">
-                historical_incident_count
+                Stored assessment signal (risk_assessment)
               </span>
             </div>
 

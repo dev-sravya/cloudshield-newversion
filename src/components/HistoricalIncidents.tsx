@@ -40,6 +40,9 @@ export const HistoricalIncidents: React.FC<HistoricalIncidentsProps> = ({
           </h2>
         </div>
         <div className="flex items-center gap-2">
+          <span className="text-xs font-mono text-cyan-300 bg-slate-900 px-2.5 py-1 rounded border border-slate-800">
+            {incidents.length} matching historical incident {incidents.length === 1 ? 'record' : 'records'}
+          </span>
           <span className="text-xs font-mono text-slate-400 bg-slate-900 px-2.5 py-1 rounded border border-slate-800">
             Source: cloudshield.incidents
           </span>
@@ -53,10 +56,10 @@ export const HistoricalIncidents: React.FC<HistoricalIncidentsProps> = ({
         >
           <CheckCircle2 className="w-8 h-8 text-emerald-500/80 mx-auto mb-2" />
           <p className="text-base font-medium text-slate-300">
-            No historical incidents found for this resource.
+            No matching historical incident records found for this resource.
           </p>
           <p className="text-xs text-slate-500 font-mono mt-1">
-            Zero prior failure records logged in cloudshield.incidents for resource <code className="text-cyan-400">{resourceId}</code>.
+            0 matching historical incident records logged in cloudshield.incidents for resource <code className="text-cyan-400">{resourceId}</code>.
           </p>
         </div>
       ) : (
