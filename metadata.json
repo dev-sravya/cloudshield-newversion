@@ -1,0 +1,6 @@
+{
+  "name": "CloudShield",
+  "description": "Understand the impact before you deploy. AI-powered Cloud Change Risk Assistant using Google BigQuery and Gemini.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
