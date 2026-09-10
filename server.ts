@@ -113,7 +113,7 @@ function connectedIdsAdd(set: Set<string>, id: unknown) {
   }
 }
 
-async function callWithTimeout<T>(promise: Promise<T>, timeoutMs = 4000): Promise<T> {
+async function callWithTimeout<T>(promise: Promise<T>, timeoutMs = 20000): Promise<T> {
   let timer: NodeJS.Timeout;
   const timeoutPromise = new Promise<never>((_, reject) => {
     timer = setTimeout(() => reject(new Error(`AI generation timed out after ${timeoutMs}ms`)), timeoutMs);
@@ -183,7 +183,7 @@ Respond in JSON matching schema:
           },
         },
       }),
-      4000
+      20000
     );
 
     const parsed = JSON.parse(geminiResponse.text?.trim() || '{}');
@@ -775,7 +775,7 @@ Provide your response in JSON format with an "explanation" string addressing:
               },
             },
           }),
-          4000
+          20000
         );
 
         const parsed = JSON.parse(geminiResponse.text?.trim() || '{}');
@@ -878,7 +878,7 @@ Return JSON strictly matching schema:
             responseMimeType: 'application/json',
           },
         }),
-        4000
+        20000
       );
 
       const parsed = JSON.parse(geminiResponse.text?.trim() || '{}');
