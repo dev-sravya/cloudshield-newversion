@@ -99,7 +99,7 @@ export interface AssessmentResponse {
   incidents: IncidentRecord[];
   aiExplanation: {
     content: string;
-    source: 'gemini' | 'evidence-fallback';
+    source: 'gemini' | 'evidence-fallback' | 'unavailable' | 'rule-based';
     error?: string;
   };
   changeGate: ChangeGateResult;

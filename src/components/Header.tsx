@@ -70,7 +70,7 @@ export const Header: React.FC<HeaderProps> = ({
             className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-indigo-500/20 bg-indigo-950/30 text-indigo-300 text-xs font-mono"
           >
             <Sparkles className="w-3.5 h-3.5 text-indigo-400" />
-            <span>{geminiAvailable ? 'Gemini 3.8 Flash' : 'Gemini Offline'}</span>
+            <span>{geminiAvailable ? 'Gemini (Vertex AI)' : 'Gemini Offline'}</span>
           </div>
 
           {/* Status Refresh */}

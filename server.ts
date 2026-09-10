@@ -25,17 +25,20 @@ function getBigQuery(): BigQuery {
   return bigQueryClient;
 }
 
-// Lazy initialization of Gemini client
+// Vertex AI / Gemini configuration using Google Cloud Application Default Credentials (ADC)
+const VERTEX_PROJECT_ID = process.env.VERTEX_AI_PROJECT_ID || process.env.GOOGLE_CLOUD_PROJECT || 'project-89de941d-00d0-4f2f-98f';
+const VERTEX_LOCATION = process.env.VERTEX_AI_LOCATION || 'europe-west1';
+const VERTEX_MODEL = process.env.VERTEX_AI_MODEL || 'gemini-2.5-flash';
+
+// Lazy initialization of Vertex AI client using Application Default Credentials (ADC)
 let geminiClient: GoogleGenAI | null = null;
 
 function getGemini(): GoogleGenAI {
   if (!geminiClient) {
-    const apiKey = process.env.GEMINI_API_KEY;
-    if (!apiKey) {
-      throw new Error('GEMINI_API_KEY environment variable is missing.');
-    }
     geminiClient = new GoogleGenAI({
-      apiKey,
+      vertexai: true,
+      project: VERTEX_PROJECT_ID,
+      location: VERTEX_LOCATION,
       httpOptions: {
         headers: {
           'User-Agent': 'aistudio-build',
@@ -44,6 +47,55 @@ function getGemini(): GoogleGenAI {
     });
   }
   return geminiClient;
+}
+
+let lastGeminiProbeTime = 0;
+let cachedGeminiStatus: {
+  available: boolean;
+  project: string;
+  location: string;
+  model: string;
+  authMethod: string;
+  error: string | null;
+  lastChecked: string;
+} | null = null;
+
+async function checkGeminiStatus(force = false) {
+  const now = Date.now();
+  if (!force && cachedGeminiStatus && now - lastGeminiProbeTime < 30000) {
+    return cachedGeminiStatus;
+  }
+
+  let available = false;
+  let error: string | null = null;
+
+  try {
+    const gemini = getGemini();
+    await callWithTimeout(
+      gemini.models.generateContent({
+        model: VERTEX_MODEL,
+        contents: 'ping',
+      }),
+      3500
+    );
+    available = true;
+  } catch (err: unknown) {
+    error = err instanceof Error ? err.message : String(err);
+    available = false;
+  }
+
+  lastGeminiProbeTime = now;
+  cachedGeminiStatus = {
+    available,
+    project: VERTEX_PROJECT_ID,
+    location: VERTEX_LOCATION,
+    model: VERTEX_MODEL,
+    authMethod: 'Application Default Credentials (ADC) / Vertex AI',
+    error,
+    lastChecked: new Date().toISOString(),
+  };
+
+  return cachedGeminiStatus;
 }
 
 // Helper to safely format dates from BigQuery
@@ -115,7 +167,7 @@ Respond in JSON matching schema:
 
     const geminiResponse = await callWithTimeout(
       gemini.models.generateContent({
-        model: 'gemini-3.8-flash',
+        model: VERTEX_MODEL,
         contents: prompt,
         config: {
           responseMimeType: 'application/json',
@@ -166,7 +218,7 @@ Respond in JSON matching schema:
 
     return {
       decision: fallbackDecision,
-      decisionReason: `Evidence rule: Stored BigQuery risk is ${riskLvl} in ${env} on a ${crit} resource with ${incCount} prior incidents.`,
+      decisionReason: `Rule-based evaluation (AI unavailable: ${errorMsg}): Stored BigQuery risk is ${riskLvl} in ${env} on a ${crit} resource with ${incCount} prior incidents.`,
       evidencePoints: [
         `Risk level in BigQuery: ${riskLvl}`,
         `Environment: ${env} | Criticality: ${crit}`,
@@ -178,7 +230,7 @@ Respond in JSON matching schema:
         'Verify pre-deployment snapshot and health checks',
         'Prepare automated rollback plan',
       ],
-      source: 'evidence-rule',
+      source: 'rule-based',
       error: errorMsg,
     };
   }
@@ -192,6 +244,8 @@ async function startServer() {
   // 1. GET /api/status
   // ==========================================
   app.get('/api/status', async (req: Request, res: Response) => {
+    const geminiStatus = await checkGeminiStatus();
+
     try {
       const bq = getBigQuery();
       // Test real BigQuery access against the changes table
@@ -210,9 +264,7 @@ async function startServer() {
           verifiedQuery: `SELECT change_id FROM \`${PROJECT_ID}.${DATASET_ID}.changes\` LIMIT 1`,
           sampleRowsRetrieved: rows.length,
         },
-        gemini: {
-          available: !!process.env.GEMINI_API_KEY,
-        },
+        gemini: geminiStatus,
       });
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : String(err);
@@ -226,9 +278,7 @@ async function startServer() {
           dataset: DATASET_ID,
           location: LOCATION,
         },
-        gemini: {
-          available: !!process.env.GEMINI_API_KEY,
-        },
+        gemini: geminiStatus,
       });
     }
   });
@@ -689,7 +739,7 @@ async function startServer() {
 
       // AI Risk Explanation
       let aiExplanationText = '';
-      let aiSource: 'gemini' | 'evidence-fallback' = 'evidence-fallback';
+      let aiSource: 'gemini' | 'evidence-fallback' | 'unavailable' = 'unavailable';
       let aiError: string | undefined = undefined;
 
       try {
@@ -712,7 +762,7 @@ Provide your response in JSON format with an "explanation" string addressing:
 
         const geminiResponse = await callWithTimeout(
           gemini.models.generateContent({
-            model: 'gemini-3.8-flash',
+            model: VERTEX_MODEL,
             contents: geminiPrompt,
             config: {
               responseMimeType: 'application/json',
@@ -733,12 +783,8 @@ Provide your response in JSON format with an "explanation" string addressing:
         aiSource = 'gemini';
       } catch (geminiErr: unknown) {
         aiError = geminiErr instanceof Error ? geminiErr.message : String(geminiErr);
-        const riskLvl = riskRecord?.risk_level || 'UNKNOWN';
-        const env = resourceRecord?.environment || riskRecord?.environment || 'unknown';
-        const crit = resourceRecord?.criticality || riskRecord?.criticality || 'unknown';
-        const incCount = riskRecord?.historical_incident_count ?? incidents.length;
-
-        aiExplanationText = `Evidence Summary: Change ${changeRecord.change_id} affects ${targetResourceId} in ${env} (${crit} criticality). Stored BigQuery risk level is ${riskLvl}. There are ${incCount} recorded historical incidents and ${depRows.length} dependency relationships. (AI reasoning notice: ${aiError})`;
+        aiSource = 'unavailable';
+        aiExplanationText = `Gemini AI reasoning unavailable: ${aiError}`;
       }
 
       // Evaluate Change Gate
@@ -826,7 +872,7 @@ Return JSON strictly matching schema:
 
       const geminiResponse = await callWithTimeout(
         gemini.models.generateContent({
-          model: 'gemini-3.8-flash',
+          model: VERTEX_MODEL,
           contents: whatIfPrompt,
           config: {
             responseMimeType: 'application/json',
@@ -839,47 +885,12 @@ Return JSON strictly matching schema:
       res.json({ ok: true, simulation: parsed });
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : String(err);
-      console.warn('What-If Gemini call failed, generating qualitative evidence fallback:', message);
-
-      const currentRisk = evidence.risk_assessment?.risk_level || 'HIGH';
-      const currentEnv = evidence.resource?.environment || 'production';
-      const depCount = Array.isArray(evidence.dependencies) ? evidence.dependencies.length : 0;
-      const incCount = Array.isArray(evidence.incidents) ? evidence.incidents.length : 0;
-
-      const qualitativeResult = {
-        scenario,
-        current: {
-          riskAssessment: `Current stored risk is ${currentRisk} in ${currentEnv}.`,
-          potentialBlastRadius: `${depCount} direct dependency connections recorded in BigQuery.`,
-          historicalEvidence: `${incCount} recorded incident(s) on target resource.`,
-          productionExposure: currentEnv.toLowerCase() === 'production' ? 'Full production exposure with direct client impact.' : 'Non-production environment.',
-          recommendedSafeguards: ['Standard deployment review', 'Manual monitoring during execution'],
-        },
-        whatIf: {
-          riskAssessment: scenario.includes('staging') 
-            ? 'Reduced initial risk: Staging deployment validates configuration prior to production exposure.'
-            : scenario.includes('safeguards') 
-              ? 'Mitigated execution risk: Active verification and phased canary rollout reduce failure rate.'
-              : scenario.includes('blast') 
-                ? 'Constrained impact: Isolating dependent services prevents cascading failures.'
-                : 'Elevated risk: Bypassing safeguards leaves zero margin for deployment anomaly.',
-          potentialBlastRadius: scenario.includes('blast') 
-            ? 'Blast radius partitioned to isolated node before downstream propagation.' 
-            : `${depCount} connected components potentially impacted.`,
-          historicalEvidence: `Historical incidents (${incCount}) emphasize need for regression checks on previous failure modes.`,
-          productionExposure: scenario.includes('staging') 
-            ? 'Zero initial production exposure during validation phase.' 
-            : 'Production impact mitigated through controlled traffic steering.',
-          recommendedSafeguards: [
-            'Canary deployment with 5% traffic split',
-            'Pre-deployment database snapshot',
-            'Automated error-rate threshold circuit breaker',
-          ],
-        },
-        analysis: `What-If analysis: Simulating "${scenario}" qualitatively shifts the operational risk profile by addressing known BigQuery dependency relationships (${depCount}) and historical incident concerns (${incCount}).`,
-      };
-
-      res.json({ ok: true, simulation: qualitativeResult, fallback: true, error: message });
+      console.warn('What-If Gemini call failed:', message);
+      res.status(503).json({
+        ok: false,
+        error: 'Gemini simulation unavailable',
+        details: message,
+      });
     }
   });
 

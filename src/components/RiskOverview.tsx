@@ -181,7 +181,7 @@ export const RiskOverview: React.FC<RiskOverviewProps> = ({ assessment }) => {
                     Category: {changeCategory}
                   </span>
                   <span className="text-[10px] font-mono text-slate-500">
-                    Engine: {aiExplanation.source === 'gemini' ? 'Gemini 3.8 Flash' : 'Evidence Baseline'}
+                    Engine: {aiExplanation.source === 'gemini' ? 'Gemini (Vertex AI)' : 'AI Unavailable'}
                   </span>
                 </div>
               </div>
@@ -202,7 +202,7 @@ export const RiskOverview: React.FC<RiskOverviewProps> = ({ assessment }) => {
               </span>
               {aiExplanation.error && (
                 <span className="text-rose-400 text-[11px]" title={aiExplanation.error}>
-                  (AI fallback active)
+                  (AI unavailable)
                 </span>
               )}
             </div>

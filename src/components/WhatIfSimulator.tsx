@@ -155,6 +155,17 @@ export const WhatIfSimulator: React.FC<WhatIfSimulatorProps> = ({ assessment }) 
           </div>
         )}
 
+        {/* Error Notice */}
+        {!isLoading && error && (
+          <div className="p-4 rounded-xl border border-rose-900/60 bg-rose-950/30 text-rose-300 text-xs font-mono flex items-start gap-2.5">
+            <AlertTriangle className="w-4 h-4 text-rose-400 shrink-0 mt-0.5" />
+            <div>
+              <span className="font-bold text-rose-200 block">Simulation Notice:</span>
+              <p className="mt-0.5 leading-relaxed">{error}</p>
+            </div>
+          </div>
+        )}
+
         {/* Side-by-Side Comparison: CURRENT vs WHAT-IF */}
         {!isLoading && simulation && (
           <div className="space-y-6">
